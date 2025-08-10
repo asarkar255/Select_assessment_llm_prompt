@@ -1,7 +1,7 @@
-# app_select_assess_prompt_langchain.py
+# app_select_assess_prompt_strict.py
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Dict, Any
 import os, json
 
 # ---- LLM is mandatory (no fallback) ----
@@ -13,87 +13,84 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 # LangChain + OpenAI
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser  # NOTE: correct import path
+from langchain_core.output_parsers import JsonOutputParser  # correct path in recent LangChain
 
-app = FastAPI(title="SELECT* Assessment & LLM Prompt (LangChain, no fallback)")
+app = FastAPI(title="SELECT Assessment & LLM Prompt (Strict Schema, LangChain, no fallback)")
 
-# ====== Input models (minimal & flexible) ======
+# ====== Strict input models ======
 class SelectItem(BaseModel):
-    """
-    A flexible schema for one SELECT analysis item.
-    Send whatever fields you have; common examples are shown as optional.
-    """
-    table: Optional[str] = None
-    used_fields: Optional[List[str]] = None       # fields actually used downstream
-    star_used: Optional[bool] = None              # whether original code used SELECT * / SELECT SINGLE *
-    where_fields: Optional[List[str]] = None      # fields used in WHERE
-    into_target: Optional[str] = None             # var/table receiving the row(s)
-    join_tables: Optional[List[str]] = None       # if joins exist
-    snippet: Optional[str] = None                 # raw ABAP SELECT snippet
-    line: Optional[int] = None                    # source line, if available
-    notes: Optional[str] = None                   # free-form notes
-    # any additional keys the caller provides will be accepted
+    table: str
+    target_type: str
+    target_name: str
+    used_fields: List[str]
+    suggested_fields: List[str]
+    suggested_statement: str
+
+    @field_validator("used_fields", "suggested_fields")
+    @classmethod
+    def no_none_elems(cls, v: List[str]) -> List[str]:
+        return [x for x in v if x is not None]
 
 class Unit(BaseModel):
-    """
-    Mirrors the earlier MATNR pattern: you can pass program/include metadata plus 'selects'.
-    """
-    pgm_name: Optional[str] = ""
-    inc_name: Optional[str] = ""
-    type: Optional[str] = ""          # e.g., "perform", "method", "raw_code"
-    name: Optional[str] = ""          # unit name (FORM/METHOD/etc.)
-    class_implementation: Optional[str] = ""
-    start_line: Optional[int] = 0
-    end_line: Optional[int] = 0
-    code: Optional[str] = ""          # optional: raw ABAP block (helpful but not required)
-    selects: Optional[List[SelectItem]] = Field(default=None)
+    pgm_name: str
+    inc_name: str
+    type: str
+    name: str
+    selects: List[SelectItem] = Field(default_factory=list)
 
-# ====== Agentic planning-lite: summarize the 'selects' for the LLM ======
+# ====== Agentic-lite planner ======
 def summarize_selects(unit: Unit) -> Dict[str, Any]:
-    selects = unit.selects or []
-    total = len(selects)
-    star_count = sum(1 for s in selects if (s.star_used is True))
-    tables = {}
-    fields_needed = set()
-    for s in selects:
-        if s.table:
-            tables[s.table] = tables.get(s.table, 0) + 1
-        if s.used_fields:
-            for f in s.used_fields:
-                fields_needed.add(f)
+    tables_count: Dict[str, int] = {}
+    total = len(unit.selects)
+    used_fields_union = set()
+    suggested_fields_union = set()
+
+    for s in unit.selects:
+        tables_count[s.table] = tables_count.get(s.table, 0) + 1
+        for f in s.used_fields:
+            if f:
+                used_fields_union.add(f.upper())
+        for f in s.suggested_fields:
+            if f:
+                suggested_fields_union.add(f.upper())
+
     return {
         "program": unit.pgm_name,
         "include": unit.inc_name,
         "unit_type": unit.type,
         "unit_name": unit.name,
-        "range": {"start_line": unit.start_line or 0, "end_line": unit.end_line or 0},
         "stats": {
             "total_selects": total,
-            "star_selects": star_count,
-            "tables_frequency": tables,
-            "unique_used_fields_count": len(fields_needed),
+            "tables_frequency": tables_count,
+            "unique_used_fields": sorted(used_fields_union),
+            "unique_suggested_fields": sorted(suggested_fields_union),
         }
     }
 
 # ====== LangChain prompt & chain ======
-SYSTEM_MSG = "You are a precise ABAP remediation planner that outputs strict JSON only."
+SYSTEM_MSG = "You are a precise ABAP reviewer who outputs strict JSON only."
 
 USER_TEMPLATE = """
-You are a senior ABAP reviewer and modernization planner.
+You are assessing ABAP SELECT usage for an ECC system (no 7.4+ syntax). 
+We provide structured entries under `selects` with:
+- table, target_type, target_name
+- used_fields (fields actually needed downstream)
+- suggested_fields (what we believe the SELECT list should be)
+- suggested_statement (a proposed non-* SELECT)
 
-We are assessing **SELECT usage**, especially SELECT * (or SELECT SINGLE *) and overfetching.
-Your job for this unit is:
-1) Create a concise, human-readable **assessment** paragraph for a report, based ONLY on the provided `selects` entries.
-   - Highlight risks like SELECT * overfetch, unused columns, missing explicit field lists, unnecessary ORDER BY, etc.
-   - Mention why it matters (performance, memory, network, and maintainability).
+Your job:
+1) Produce a concise human-readable **assessment** paragraph:
+   - Summarize risks from SELECT * or overfetching vs. what `used_fields` indicate.
+   - Note performance/memory/network/maintainability impacts.
+   - Mention any mismatch between used_fields and suggested_fields.
    - Keep it factual and brief.
-2) Produce a **remediation LLM prompt** to be used later. The prompt must:
-   - Reference the unit metadata (program/include/unit/lines).
-   - Use only ECC-safe syntax (no 7.4+ features).
-   - Instruct the LLM to replace `SELECT *` with an explicit field list derived from `used_fields`.
-   - Preserve behavior; do not change business logic.
-   - Require output JSON with: original_code, remediated_code, changes[] (line, before, after, reason).
-   - If `used_fields` is empty or missing, instruct the LLM to propose a safe minimal set or mark as "needs-review".
+
+2) Produce an actionable **LLM remediation prompt** for later:
+   - Reference metadata (program/include/unit).
+   - Ask to replace SELECT * with explicit field list from `suggested_fields`.
+   - Preserve behavior; ECC-safe ABAP only (no 7.4+).
+   - Require output JSON with keys: original_code, remediated_code, changes[] (line/before/after/reason). 
+   - If suggested_statement is provided, instruct using it as the base; if empty, request generation from suggested_fields.
 
 Return ONLY strict JSON with keys:
 {{
@@ -106,11 +103,7 @@ Unit metadata:
 - Include: {inc_name}
 - Unit type: {unit_type}
 - Unit name: {unit_name}
-- Start line: {start_line}
-- End line: {end_line}
 
-ABAP code (optional; may be empty or truncated):
-{code}
 Planning summary (agentic):
 {plan_json}
 
@@ -129,50 +122,40 @@ llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0.0)
 parser = JsonOutputParser()
 chain = prompt | llm | parser
 
-# ====== Core LLM call via LangChain ======
-def llm_assess_and_prompt_for_selects(unit: Unit) -> Dict[str, str]:
-    selects_json = json.dumps([s.model_dump() for s in (unit.selects or [])], ensure_ascii=False, indent=2)
-
-    # truncate huge code blocks to save tokens
-    code = unit.code or ""
-    MAX = 20000
-    if len(code) > MAX:
-        code = code[:MAX] + "\n*TRUNCATED*"
-
+# ====== Core LLM call ======
+def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
     plan = summarize_selects(unit)
     plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
+    selects_json = json.dumps([s.model_dump() for s in unit.selects], ensure_ascii=False, indent=2)
 
     try:
         return chain.invoke(
             {
-                "pgm_name": unit.pgm_name or "",
-                "inc_name": unit.inc_name or "",
-                "unit_type": unit.type or "",
-                "unit_name": unit.name or "",
-                "start_line": unit.start_line or 0,
-                "end_line": unit.end_line or 0,
-                "code": code,
+                "pgm_name": unit.pgm_name,
+                "inc_name": unit.inc_name,
+                "unit_type": unit.type,
+                "unit_name": unit.name,
                 "plan_json": plan_json,
                 "selects_json": selects_json,
             }
         )
     except Exception as e:
-        # hard fail (no fallback)
+        # hard fail by design
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
 
 # ====== API ======
 @app.post("/assess-selects")
 def assess_selects(units: List[Unit]) -> List[Dict[str, Any]]:
     """
-    Input: array of units each potentially containing `selects` (list of SelectItem).
-    Output: same array, but replacing `selects` with:
+    Input: array of units with strict `selects` items.
+    Output: same array, replacing `selects` with:
       - 'assessment' (string)
       - 'llm_prompt' (string)
     """
     out: List[Dict[str, Any]] = []
     for u in units:
         obj = u.model_dump()
-        llm_out = llm_assess_and_prompt_for_selects(u)
+        llm_out = llm_assess_and_prompt(u)
         obj["assessment"] = llm_out.get("assessment", "")
         obj["llm_prompt"] = llm_out.get("llm_prompt", "")
         obj.pop("selects", None)  # remove as requested
