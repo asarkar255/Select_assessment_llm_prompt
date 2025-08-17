@@ -87,7 +87,9 @@ Your job:
    - Mention any mismatch between used_fields and suggested_fields.
    - Keep it factual and brief.
 
-2) Produce an actionable **LLM remediation prompt** for later:
+2) Produce an actionable **LLM remediation prompt** for later.
+   The prompt must be:
+   - To the point,concise and contain **no more than 5 numbered bullet points**
    - Reference metadata (program/include/unit).
    - Ask to replace SELECT * with explicit field list from `suggested_fields`.
    - Preserve behavior; ECC-safe ABAP only (no 7.4+).
