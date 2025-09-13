@@ -73,7 +73,7 @@ def summarize_selects(unit: Unit) -> Dict[str, Any]:
 SYSTEM_MSG = "You are a precise ABAP reviewer who outputs strict JSON only."
 
 USER_TEMPLATE = """
-You are assessing ABAP SELECT usage for an ECC system (no 7.4+ syntax). 
+You are assessing ABAP SELECT usage for an S4HANA System ( 7.4+ syntax). 
 We provide structured entries under `selects` with:
 - table, target_type, target_name
 - used_fields (fields actually needed downstream)
@@ -92,7 +92,7 @@ Your job:
    - To the point,concise and contain **no more than 5 numbered bullet points**
    - Reference metadata (program/include/unit).
    - Ask to replace SELECT * with explicit field list from `suggested_fields`.
-   - Preserve behavior; ECC-safe ABAP only (no 7.4+).
+   - Preserve behavior; S4HANA COmpatible ABAP only (abap 7.4+ Syntax).
    - Require output JSON with keys: original_code, remediated_code, changes[] (line/before/after/reason). 
    - If suggested_statement is provided, instruct using it as the base; if empty, request generation from suggested_fields.
 
